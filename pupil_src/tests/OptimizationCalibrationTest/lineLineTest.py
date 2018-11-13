@@ -22,7 +22,8 @@ import math_helper
 from numpy import array, cross, dot, double, hypot, zeros
 from math import acos, atan2, cos, pi, sin, radians
 from calibration_routines.visualizer_calibration import *
-from calibration_routines.calibrate import find_rigid_transform
+from math_helper import find_rigid_transform
+
 
 def show_result(observers,points, name = "Calibration"):
 
