@@ -31,7 +31,7 @@ import glfw
 import player_methods as pm
 import zmq_tools
 from calibration_routines import gaze_mapping_plugins
-from calibration_routines.finish_calibration import select_calibration_method
+from calibration_routines.finish_calibration import select_method_and_perform_calibration
 from methods import normalize
 from plugin import Producer_Plugin_Base
 
@@ -185,7 +185,7 @@ def calibrate_and_map(g_pool, ref_list, calib_list, map_list, x_offset, y_offset
         msgpack.unpackb(serialized, raw=False, use_list=False)
         for serialized in calib_list
     ]
-    method, result = select_calibration_method(g_pool, calib_list, ref_list)
+    method, result = select_method_and_perform_calibration(g_pool, calib_list, ref_list)
     if result["subject"] != "calibration.failed":
         logger.info(
             "Offline calibration successful. Starting mapping using {}.".format(method)
