@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -68,7 +68,10 @@ class Remote_Recorder_Core:
         self.num_states_changed = num_states_changed_callback
 
         self._attached_rec_states = {}
-        self._network = ndsi.Network(callbacks=(self.on_event,))
+        self._network = ndsi.Network(
+            formats={ndsi.DataFormat.V3},
+            callbacks=(self.on_event,)
+        )
         self._network.start()
 
     def poll_network_events(self):

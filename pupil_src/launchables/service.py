@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -9,16 +9,22 @@ See COPYING and COPYING.LESSER for license details.
 ---------------------------------------------------------------------------~(*)
 """
 import os
+import signal
 
 # import sys, platform
-
-
-class Global_Container(object):
-    pass
+from types import SimpleNamespace
 
 
 def service(
-    timebase, eyes_are_alive, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, version
+    timebase,
+    eye_procs_alive,
+    ipc_pub_url,
+    ipc_sub_url,
+    ipc_push_url,
+    user_dir,
+    version,
+    preferred_remote_port,
+    hide_ui,
 ):
     """Maps pupil to gaze data, can run various plug-ins.
 
@@ -100,15 +106,27 @@ def service(
         from frame_publisher import Frame_Publisher
         from blink_detection import Blink_Detection
         from service_ui import Service_UI
-
         from background_helper import IPC_Logging_Task_Proxy
+
         IPC_Logging_Task_Proxy.push_url = ipc_push_url
+
+        process_was_interrupted = False
+
+        def interrupt_handler(sig, frame):
+            import traceback
+
+            trace = traceback.format_stack(f=frame)
+            logger.debug(f"Caught signal {sig} in:\n" + "".join(trace))
+            nonlocal process_was_interrupted
+            process_was_interrupted = True
+
+        signal.signal(signal.SIGINT, interrupt_handler)
 
         logger.info("Application Version: {}".format(version))
         logger.info("System Info: {}".format(get_system_info()))
 
         # g_pool holds variables for this process they are accesible to all plugins
-        g_pool = Global_Container()
+        g_pool = SimpleNamespace()
         g_pool.app = "service"
         g_pool.user_dir = user_dir
         g_pool.version = version
@@ -118,8 +136,10 @@ def service(
         g_pool.ipc_pub_url = ipc_pub_url
         g_pool.ipc_sub_url = ipc_sub_url
         g_pool.ipc_push_url = ipc_push_url
-        g_pool.eyes_are_alive = eyes_are_alive
+        g_pool.eye_procs_alive = eye_procs_alive
         g_pool.timebase = timebase
+        g_pool.preferred_remote_port = preferred_remote_port
+        g_pool.hide_ui = hide_ui
 
         def get_timestamp():
             return get_time_monotonic() - g_pool.timebase.value
@@ -179,10 +199,24 @@ def service(
 
         audio.audio_mode = session_settings.get("audio_mode", audio.default_audio_mode)
 
+        ipc_pub.notify({"subject": "service_process.started"})
+        logger.warning("Process started.")
+        g_pool.service_should_run = True
+
         # plugins that are loaded based on user settings from previous session
         g_pool.plugins = Plugin_List(
             g_pool, session_settings.get("loaded_plugins", default_plugins)
         )
+
+        # NOTE: The Pupil_Remote plugin fails to load when the port is already in use
+        # and will set this variable to false. Then we should not even start the eye
+        # processes. Otherwise we would have to wait for their initialization before
+        # attempting cleanup in Service.
+        if g_pool.service_should_run:
+            if session_settings.get("eye1_process_alive", True):
+                launch_eye_process(1, delay=0.3)
+            if session_settings.get("eye0_process_alive", True):
+                launch_eye_process(0, delay=0.0)
 
         def handle_notifications(n):
             subject = n["subject"]
@@ -224,22 +258,13 @@ def service(
                             }
                         )
 
-        if session_settings.get("eye1_process_alive", False):
-            launch_eye_process(1, delay=0.3)
-        if session_settings.get("eye0_process_alive", True):
-            launch_eye_process(0, delay=0.0)
-
-        ipc_pub.notify({"subject": "service_process.started"})
-        logger.warning("Process started.")
-        g_pool.service_should_run = True
-
         # initiate ui update loop
         ipc_pub.notify(
             {"subject": "service_process.ui.should_update", "initial_delay": 1 / 40}
         )
 
         # Event loop
-        while g_pool.service_should_run:
+        while g_pool.service_should_run and not process_was_interrupted:
             socks = dict(poller.poll())
             if pupil_sub.socket in socks:
                 topic, pupil_datum = pupil_sub.recv()
@@ -266,8 +291,8 @@ def service(
 
         session_settings["loaded_plugins"] = g_pool.plugins.get_initializers()
         session_settings["version"] = str(g_pool.version)
-        session_settings["eye0_process_alive"] = eyes_are_alive[0].value
-        session_settings["eye1_process_alive"] = eyes_are_alive[1].value
+        session_settings["eye0_process_alive"] = eye_procs_alive[0].value
+        session_settings["eye1_process_alive"] = eye_procs_alive[1].value
         session_settings[
             "min_calibration_confidence"
         ] = g_pool.min_calibration_confidence
@@ -280,7 +305,7 @@ def service(
             pupil_datum.alive = False
         g_pool.plugins.clean()
 
-    except:
+    except Exception:
         import traceback
 
         trace = traceback.format_exc()
@@ -301,21 +326,29 @@ def service(
 
 
 def service_profiled(
-    timebase, eyes_are_alive, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, version
+    timebase,
+    eye_procs_alive,
+    ipc_pub_url,
+    ipc_sub_url,
+    ipc_push_url,
+    user_dir,
+    version,
+    preferred_remote_port,
 ):
     import cProfile, subprocess, os
     from .service import service
 
     cProfile.runctx(
-        "service(timebase,eyes_are_alive,ipc_pub_url,ipc_sub_url,ipc_push_url,user_dir,version)",
+        "service(timebase,eye_procs_alive,ipc_pub_url,ipc_sub_url,ipc_push_url,user_dir,version)",
         {
             "timebase": timebase,
-            "eyes_are_alive": eyes_are_alive,
+            "eye_procs_alive": eye_procs_alive,
             "ipc_pub_url": ipc_pub_url,
             "ipc_sub_url": ipc_sub_url,
             "ipc_push_url": ipc_push_url,
             "user_dir": user_dir,
             "version": version,
+            "preferred_remote_port": preferred_remote_port,
         },
         locals(),
         "service.pstats",

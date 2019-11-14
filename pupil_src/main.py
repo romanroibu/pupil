@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -11,30 +11,44 @@ See COPYING and COPYING.LESSER for license details.
 
 import os, sys, platform
 
-# sys.argv.append('profiled')
-# sys.argv.append('debug')
-# sys.argv.append('service')
-
-app = "capture"
-
-if getattr(sys, "frozen", False):
-    if "pupil_service" in sys.executable:
-        app = "service"
-    elif "pupil_player" in sys.executable:
-        app = "player"
-    # Specifiy user dir.
-    user_dir = os.path.expanduser(os.path.join("~", "pupil_{}_settings".format(app)))
-    version_file = os.path.join(sys._MEIPASS, "_version_string_")
-else:
-    if "service" in sys.argv:
-        app = "service"
-    if "player" in sys.argv:
-        app = "player"
+running_from_bundle = getattr(sys, "frozen", False)
+if not running_from_bundle:
     pupil_base_dir = os.path.abspath(__file__).rsplit("pupil_src", 1)[0]
     sys.path.append(os.path.join(pupil_base_dir, "pupil_src", "shared_modules"))
+
+from launchable_args import PupilArgParser
+
+# NOTE: hyphens (-) in the CLI args are converted to underscores (_) upon parsing, so
+# "--hide-ui" becomes "hide_ui" in python
+default_args = {
+    "debug": False,
+    "profile": False,
+    "version": False,
+    "hide_ui": False,
+    "port": 50020,
+}
+parsed_args, unknown_args = PupilArgParser().parse(running_from_bundle, **default_args)
+
+# app version
+from version_utils import get_version
+
+app_version = get_version()
+if parsed_args.version:
+    running_from = "bundle" if running_from_bundle else "source"
+    version_message = (
+        f"Pupil {parsed_args.app.capitalize()} version {app_version} ({running_from})"
+    )
+
+    print(version_message)
+    sys.exit()
+
+if running_from_bundle:
     # Specifiy user dir.
-    user_dir = os.path.join(pupil_base_dir, "{}_settings".format(app))
-    version_file = None
+    folder_name = "pupil_{}_settings".format(parsed_args.app)
+    user_dir = os.path.expanduser(os.path.join("~", folder_name))
+else:
+    # Specifiy user dir.
+    user_dir = os.path.join(pupil_base_dir, "{}_settings".format(parsed_args.app))
 
 # create folder for user settings, tmp data
 if not os.path.isdir(user_dir):
@@ -44,11 +58,6 @@ if not os.path.isdir(user_dir):
 plugin_dir = os.path.join(user_dir, "plugins")
 if not os.path.isdir(plugin_dir):
     os.mkdir(plugin_dir)
-
-# app version
-from version_utils import get_version
-
-app_version = get_version(version_file)
 
 # threading and processing
 from multiprocessing import (
@@ -72,7 +81,7 @@ from time import time
 from os_utils import Prevent_Idle_Sleep
 
 # functions to run in seperate processes
-if "profiled" in sys.argv:
+if parsed_args.profile:
     from launchables.world import world_profiled as world
     from launchables.service import service_profiled as service
     from launchables.eye import eye_profiled as eye
@@ -150,7 +159,9 @@ def launcher():
         logger.setLevel(logging.NOTSET)
         # Stream to file
         fh = logging.FileHandler(
-            os.path.join(user_dir, "{}.log".format(app)), mode="w", encoding="utf-8"
+            os.path.join(user_dir, "{}.log".format(parsed_args.app)),
+            mode="w",
+            encoding="utf-8",
         )
         fh.setFormatter(
             logging.Formatter(
@@ -177,7 +188,7 @@ def launcher():
 
     ## IPC
     timebase = Value(c_double, 0)
-    eyes_are_alive = Value(c_bool, 0), Value(c_bool, 0)
+    eye_procs_alive = Value(c_bool, 0), Value(c_bool, 0)
 
     zmq_ctx = zmq.Context()
 
@@ -217,7 +228,7 @@ def launcher():
     pull_pub.setDaemon(True)
     pull_pub.start()
 
-    log_thread = Thread(target=log_loop, args=(ipc_sub_url, "debug" in sys.argv))
+    log_thread = Thread(target=log_loop, args=(ipc_sub_url, parsed_args.debug))
     log_thread.setDaemon(True)
     log_thread.start()
 
@@ -249,12 +260,17 @@ def launcher():
             cmd_sub.recv()
             break
 
-    if app == "service":
+    import logging
+
+    if unknown_args:
+        logging.warning(f"Unknown command-line arguments: {unknown_args}")
+
+    if parsed_args.app == "service":
         cmd_push.notify({"subject": "service_process.should_start"})
-    elif app == "capture":
+    elif parsed_args.app == "capture":
         cmd_push.notify({"subject": "world_process.should_start"})
-    elif app == "player":
-        rec_dir = os.path.expanduser(sys.argv[-1])
+    elif parsed_args.app == "player":
+        rec_dir = os.path.expanduser(parsed_args.recording)
         cmd_push.notify(
             {"subject": "player_drop_process.should_start", "rec_dir": rec_dir}
         )
@@ -271,7 +287,7 @@ def launcher():
                         name="eye{}".format(eye_id),
                         args=(
                             timebase,
-                            eyes_are_alive[eye_id],
+                            eye_procs_alive[eye_id],
                             ipc_pub_url,
                             ipc_sub_url,
                             ipc_push_url,
@@ -279,6 +295,7 @@ def launcher():
                             app_version,
                             eye_id,
                             n.get("overwrite_cap_settings"),
+                            parsed_args.hide_ui,
                         ),
                     ).start()
                 elif "notify.player_process.should_start" in topic:
@@ -300,12 +317,14 @@ def launcher():
                         name="world",
                         args=(
                             timebase,
-                            eyes_are_alive,
+                            eye_procs_alive,
                             ipc_pub_url,
                             ipc_sub_url,
                             ipc_push_url,
                             user_dir,
                             app_version,
+                            parsed_args.port,
+                            parsed_args.hide_ui,
                         ),
                     ).start()
                 elif "notify.clear_settings_process.should_start" in topic:
@@ -318,12 +337,14 @@ def launcher():
                         name="service",
                         args=(
                             timebase,
-                            eyes_are_alive,
+                            eye_procs_alive,
                             ipc_pub_url,
                             ipc_sub_url,
                             ipc_push_url,
                             user_dir,
                             app_version,
+                            parsed_args.port,
+                            parsed_args.hide_ui,
                         ),
                     ).start()
                 elif "notify.player_drop_process.should_start" in topic:

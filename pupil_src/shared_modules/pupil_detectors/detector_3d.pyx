@@ -1,34 +1,38 @@
-'''
+# cython: profile=False, language_level=3
+"""
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
 See COPYING and COPYING.LESSER for license details.
 ---------------------------------------------------------------------------~(*)
-'''
+"""
 
-# cython: profile=False
-import cv2
-import numpy as np
-from coarse_pupil cimport center_surround
-from methods import Roi, normalize
-from plugin import Plugin
-from pyglui import ui
-import glfw
-from gl_utils import  adjust_gl_view, clear_gl_screen,basic_gl_setup,make_coord_system_norm_based,make_coord_system_pixel_based
-from pyglui.cygl.utils import draw_gl_texture
 import math
-
-from visualizer_3d import Eye_Visualizer
 from collections import namedtuple
 
+import cv2
+import glfw
+import numpy as np
+from cython.operator cimport dereference as deref
+from pyglui import ui
+from pyglui.cygl.utils import draw_gl_texture
+
+from coarse_pupil cimport center_surround
 from detector cimport *
 from detector_utils cimport *
-
-from cython.operator cimport dereference as deref
-
+from methods import Roi, normalize
+from gl_utils import (
+    adjust_gl_view,
+    clear_gl_screen,
+    basic_gl_setup,
+    make_coord_system_norm_based,
+    make_coord_system_pixel_based,
+)
+from plugin import Plugin
+from pupil_detectors.visualizer_3d import Eye_Visualizer
 
 cdef class Detector_3D:
 
@@ -78,7 +82,7 @@ cdef class Detector_3D:
             self.detectProperties2D["canny_treshold"] = 160
             self.detectProperties2D["canny_ration"] = 2
             self.detectProperties2D["canny_aperture"] = 5
-            self.detectProperties2D["pupil_size_max"] = 150
+            self.detectProperties2D["pupil_size_max"] = 100
             self.detectProperties2D["pupil_size_min"] = 10
             self.detectProperties2D["strong_perimeter_ratio_range_min"] = 0.8
             self.detectProperties2D["strong_perimeter_ratio_range_max"] = 1.1
@@ -95,6 +99,9 @@ cdef class Detector_3D:
 
         if not self.detectProperties3D:
             self.detectProperties3D["model_sensitivity"] = 0.997
+
+        # Never freeze model in the beginning to allow initial model fitting.
+        self.detectProperties3D["model_is_frozen"] = False
 
     def get_settings(self):
         return {'2D_Settings': self.detectProperties2D , '3D_Settings' : self.detectProperties3D }
@@ -218,8 +225,23 @@ cdef class Detector_3D:
         self.menu.append(info_3d)
         self.menu.append(ui.Button('Reset 3D model', self.reset_3D_Model ))
         self.menu.append(ui.Button('Open debug window',self.toggle_window))
-        self.menu.append(ui.Slider('model_sensitivity',self.detectProperties3D,label='Model sensitivity',min=0.990,max=1.0,step=0.0001))
-        self.menu[-1].display_format = '%0.4f'
+        model_sensitivity_slider = ui.Slider(
+            'model_sensitivity',
+            self.detectProperties3D,
+            label='Model sensitivity',
+            min=0.990,
+            max=1.0,
+            step=0.0001,
+        )
+        model_sensitivity_slider.display_format = '%0.4f'
+        self.menu.append(model_sensitivity_slider)
+        self.menu.append(
+            ui.Switch(
+                'model_is_frozen',
+                self.detectProperties3D,
+                label='Freeze model',
+            )
+        )
         # self.menu.append(ui.Slider('pupil_radius_min',self.detectProperties3D,label='Pupil min radius', min=1.0,max= 8.0,step=0.1))
         # self.menu.append(ui.Slider('pupil_radius_max',self.detectProperties3D,label='Pupil max radius', min=1.0,max=8.0,step=0.1))
         # self.menu.append(ui.Slider('max_fit_residual',self.detectProperties3D,label='3D fit max residual', min=0.00,max=0.1,step=0.0001))
@@ -244,5 +266,13 @@ cdef class Detector_3D:
 
     def visualize(self):
         if self.debugVisualizer3D.window:
-            self.debugVisualizer3D.update_window( self.g_pool, self.pyResult3D  )
+            self.debugVisualizer3D.update_window(self.g_pool, self.pyResult3D)
 
+    def set_2d_detector_property(self, name, value):
+        set_detector_property(self.detectProperties2D, name, value)
+
+    def set_3d_detector_property(self, name, value):
+        set_detector_property(self.detectProperties3D, name, value)
+
+    def get_detector_properties(self):
+        return {"2d": self.detectProperties2D, "3d": self.detectProperties3D}

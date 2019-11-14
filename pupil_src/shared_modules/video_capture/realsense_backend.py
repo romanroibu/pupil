@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -21,7 +21,7 @@ from pyrealsense.extlib import rsutilwrapper
 
 from version_utils import VersionFormat
 from .base_backend import Base_Source, Base_Manager
-from av_writer import AV_Writer
+from av_writer import MPEG_Writer
 from camera_models import load_intrinsics
 
 import glfw
@@ -779,11 +779,11 @@ class Realsense_Source(Base_Source):
             del kwargs["topic"]
             self._initialize_device(**kwargs)
         elif notification["subject"] == "recording.started":
-            self.start_depth_recording(notification["rec_path"])
+            self.start_depth_recording(notification["rec_path"], notification["start_time_synced"])
         elif notification["subject"] == "recording.stopped":
             self.stop_depth_recording()
 
-    def start_depth_recording(self, rec_loc):
+    def start_depth_recording(self, rec_loc, start_time_synced):
         if not self.record_depth:
             return
 
@@ -792,9 +792,7 @@ class Realsense_Source(Base_Source):
             return
 
         video_path = os.path.join(rec_loc, "depth.mp4")
-        self.depth_video_writer = AV_Writer(
-            video_path, fps=self.depth_frame_rate, use_timestamps=True
-        )
+        self.depth_video_writer = MPEG_Writer(video_path, start_time_synced)
 
     def stop_depth_recording(self):
         if self.depth_video_writer is None:
@@ -860,13 +858,13 @@ class Realsense_Source(Base_Source):
 
 
 class Realsense_Manager(Base_Manager):
-    """Manages Intel RealSense 3D sources
+    """Manages Intel RealSense R200 sources
 
     Attributes:
         check_intervall (float): Intervall in which to look for new UVC devices
     """
 
-    gui_name = "RealSense 3D"
+    gui_name = "RealSense R200"
 
     def get_init_dict(self):
         return {}
@@ -875,7 +873,7 @@ class Realsense_Manager(Base_Manager):
         self.add_menu()
         from pyglui import ui
 
-        self.menu.append(ui.Info_Text("Intel RealSense 3D sources"))
+        self.menu.append(ui.Info_Text("Intel RealSense R200 sources"))
 
         def pair(d):
             fmt = "- " if d["is_streaming"] else ""
@@ -916,7 +914,7 @@ class Realsense_Manager(Base_Manager):
             else:
                 self.notify_all(
                     {
-                        "subject": "start_eye_capture",
+                        "subject": "start_eye_plugin",
                         "target": self.g_pool.process,
                         "name": "Realsense_Source",
                         "args": settings,

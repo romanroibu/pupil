@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -219,7 +219,7 @@ class Screen_Marker_Calibration(Calibration_Plugin):
             if self.fullscreen:
                 try:
                     monitor = glfwGetMonitors()[self.monitor_idx]
-                except:
+                except Exception:
                     logger.warning(
                         "Monitor at index %s no longer availalbe using default"
                         % self.monitor_idx

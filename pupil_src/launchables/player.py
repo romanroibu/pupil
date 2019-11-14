@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -10,11 +10,8 @@ See COPYING and COPYING.LESSER for license details.
 """
 import os
 import platform
-
-
-class Global_Container(object):
-    pass
-
+import signal
+from types import SimpleNamespace
 
 # UI Platform tweaks
 if platform.system() == "Linux":
@@ -26,6 +23,9 @@ elif platform.system() == "Windows":
 else:
     scroll_factor = 1.0
     window_position_default = (0, 0)
+
+MIN_DATA_CONFIDENCE_DEFAULT = 0.6
+MIN_CALIBRATION_CONFIDENCE_DEFAULT = 0.8
 
 
 def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_version):
@@ -56,6 +56,13 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
     logger = logging.getLogger(__name__)
 
     try:
+        from background_helper import IPC_Logging_Task_Proxy
+
+        IPC_Logging_Task_Proxy.push_url = ipc_push_url
+
+        from tasklib.background.patches import IPCLoggingPatch
+
+        IPCLoggingPatch.ipc_push_url = ipc_push_url
 
         # imports
         from file_methods import Persistent_Dict, next_export_sub_dir
@@ -71,12 +78,13 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         import gl_utils
 
         # capture
-        from video_capture import init_playback_source
+        from video_capture import File_Source
 
         # helpers/utils
         from version_utils import VersionFormat
         from methods import normalize, denormalize, delta_t, get_system_info
         import player_methods as pm
+        from pupil_recording import PupilRecording
         from csv_utils import write_key_value_file
 
         # Plug-ins
@@ -90,34 +98,53 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         from vis_fixation import Vis_Fixation
 
         # from vis_scan_path import Vis_Scan_Path
-        from vis_eye_video_overlay import Vis_Eye_Video_Overlay
         from seek_control import Seek_Control
-        from video_export_launcher import Video_Export_Launcher
-        from offline_surface_tracker import Offline_Surface_Tracker
+        from surface_tracker import Surface_Tracker_Offline
 
         # from marker_auto_trim_marks import Marker_Auto_Trim_Marks
         from fixation_detector import Offline_Fixation_Detector
-        from batch_exporter import Batch_Exporter, Batch_Export
         from log_display import Log_Display
         from annotations import Annotation_Player
         from raw_data_exporter import Raw_Data_Exporter
         from log_history import Log_History
         from pupil_producers import Pupil_From_Recording, Offline_Pupil_Detection
-        from gaze_producers import Gaze_From_Recording, Offline_Calibration
+        from gaze_producer.gaze_from_recording import GazeFromRecording
+        from gaze_producer.gaze_from_offline_calibration import (
+            GazeFromOfflineCalibration,
+        )
         from system_graphs import System_Graphs
         from system_timelines import System_Timelines
         from blink_detection import Offline_Blink_Detection
         from audio_playback import Audio_Playback
-        from imotions_exporter import iMotions_Exporter
-        from eye_video_exporter import Eye_Video_Exporter
+        from video_export.plugins.imotions_exporter import iMotions_Exporter
+        from video_export.plugins.eye_video_exporter import Eye_Video_Exporter
+        from video_export.plugins.world_video_exporter import World_Video_Exporter
+        from head_pose_tracker.offline_head_pose_tracker import (
+            Offline_Head_Pose_Tracker,
+        )
+        from video_capture import File_Source
+        from video_overlay.plugins import Video_Overlay, Eye_Overlay
 
-        from background_helper import IPC_Logging_Task_Proxy
-
-        IPC_Logging_Task_Proxy.push_url = ipc_push_url
+        from pupil_recording import (
+            assert_valid_recording_type,
+            InvalidRecordingException,
+        )
 
         assert VersionFormat(pyglui_version) >= VersionFormat(
-            "1.23"
+            "1.24"
         ), "pyglui out of date, please upgrade to newest version"
+
+        process_was_interrupted = False
+
+        def interrupt_handler(sig, frame):
+            import traceback
+
+            trace = traceback.format_stack(f=frame)
+            logger.debug(f"Caught signal {sig} in:\n" + "".join(trace))
+            nonlocal process_was_interrupted
+            process_was_interrupted = True
+
+        signal.signal(signal.SIGINT, interrupt_handler)
 
         runtime_plugins = import_runtime_plugins(os.path.join(user_dir, "plugins"))
         system_plugins = [
@@ -125,7 +152,6 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             Seek_Control,
             Plugin_Manager,
             System_Graphs,
-            Batch_Export,
             System_Timelines,
             Audio_Playback,
         ]
@@ -136,22 +162,23 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             Vis_Light_Points,
             Vis_Cross,
             Vis_Watermark,
-            Vis_Eye_Video_Overlay,
+            Eye_Overlay,
+            Video_Overlay,
             # Vis_Scan_Path,
             Offline_Fixation_Detector,
             Offline_Blink_Detection,
-            Batch_Exporter,
-            Video_Export_Launcher,
-            Offline_Surface_Tracker,
+            Surface_Tracker_Offline,
             Raw_Data_Exporter,
             Annotation_Player,
             Log_History,
             Pupil_From_Recording,
             Offline_Pupil_Detection,
-            Gaze_From_Recording,
+            GazeFromRecording,
+            GazeFromOfflineCalibration,
+            World_Video_Exporter,
             iMotions_Exporter,
             Eye_Video_Exporter,
-            Offline_Calibration,
+            Offline_Head_Pose_Tracker,
         ] + runtime_plugins
 
         plugins = system_plugins + user_plugins
@@ -194,28 +221,33 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             g_pool.gui.update_scroll(x, y * scroll_factor)
 
         def on_drop(window, count, paths):
-            for x in range(count):
-                new_rec_dir = paths[x].decode("utf-8")
-                if pm.is_pupil_rec_dir(new_rec_dir):
-                    logger.debug("Starting new session with '{}'".format(new_rec_dir))
-                    ipc_pub.notify(
-                        {
-                            "subject": "player_drop_process.should_start",
-                            "rec_dir": new_rec_dir,
-                        }
-                    )
-                    glfw.glfwSetWindowShouldClose(window, True)
-                else:
-                    logger.error(
-                        "'{}' is not a valid pupil recording".format(new_rec_dir)
-                    )
+            paths = [paths[x].decode("utf-8") for x in range(count)]
+            for path in paths:
+                try:
+                    assert_valid_recording_type(path)
+                    _restart_with_recording(path)
+                    return
+                except InvalidRecordingException as err:
+                    logger.debug(str(err))
+
+            for plugin in g_pool.plugins:
+                if plugin.on_drop(paths):
+                    break
+
+        def _restart_with_recording(rec_dir):
+            logger.debug("Starting new session with '{}'".format(rec_dir))
+            ipc_pub.notify(
+                {"subject": "player_drop_process.should_start", "rec_dir": rec_dir}
+            )
+            glfw.glfwSetWindowShouldClose(g_pool.main_window, True)
 
         tick = delta_t()
 
         def get_dt():
             return next(tick)
 
-        meta_info = pm.load_meta_info(rec_dir)
+        recording = PupilRecording(rec_dir)
+        meta_info = recording.meta_info
 
         # log info about Pupil Platform and Platform in player.log
         logger.info("Application Version: {}".format(app_version))
@@ -226,7 +258,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         hdpi_factor = 1.0
 
         # create container for globally scoped vars
-        g_pool = Global_Container()
+        g_pool = SimpleNamespace()
         g_pool.app = "player"
         g_pool.zmq_ctx = zmq_ctx
         g_pool.ipc_pub = ipc_pub
@@ -236,14 +268,13 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         g_pool.plugin_by_name = {p.__name__: p for p in plugins}
         g_pool.camera_render_size = None
 
-        valid_ext = (".mp4", ".mkv", ".avi", ".h264", ".mjpeg", ".fake")
-        video_path = [
-            f
-            for f in glob(os.path.join(rec_dir, "world.*"))
-            if os.path.splitext(f)[1] in valid_ext
-        ][0]
-        init_playback_source(
-            g_pool, timing="external", source_path=video_path, buffered_decoding=True
+        video_path = recording.files().core().world().videos()[0].resolve()
+        File_Source(
+            g_pool,
+            timing="external",
+            source_path=video_path,
+            buffered_decoding=True,
+            fill_gaps=True,
         )
 
         # load session persistent settings
@@ -261,9 +292,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         width, height = session_settings.get("window_size", (width, height))
 
         window_pos = session_settings.get("window_position", window_position_default)
-        window_name = "Pupil Player: {} - {}".format(
-            meta_info["Recording Name"], os.path.split(rec_dir)[-1]
-        )
+        window_name = f"Pupil Player: {meta_info.recording_name} - {rec_dir}"
 
         glfw.glfwInit()
         main_window = glfw.glfwCreateWindow(width, height, window_name, None, None)
@@ -282,17 +311,17 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             logger.warning(icon_bar_width * g_pool.gui_user_scale * hdpi_factor)
             glfw.glfwSetWindowSize(main_window, *window_size)
 
-        # load pupil_positions, gaze_positions
-        g_pool.binocular = meta_info.get("Eye Mode", "monocular") == "binocular"
         g_pool.version = app_version
         g_pool.timestamps = g_pool.capture.timestamps
         g_pool.get_timestamp = lambda: 0.0
         g_pool.user_dir = user_dir
         g_pool.rec_dir = rec_dir
         g_pool.meta_info = meta_info
-        g_pool.min_data_confidence = session_settings.get("min_data_confidence", 0.6)
+        g_pool.min_data_confidence = session_settings.get(
+            "min_data_confidence", MIN_DATA_CONFIDENCE_DEFAULT
+        )
         g_pool.min_calibration_confidence = session_settings.get(
-            "min_calibration_confidence", 0.8
+            "min_calibration_confidence", MIN_CALIBRATION_CONFIDENCE_DEFAULT
         )
 
         # populated by producers
@@ -300,6 +329,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         g_pool.pupil_positions_by_id = (pm.Bisector(), pm.Bisector())
         g_pool.gaze_positions = pm.Bisector()
         g_pool.fixations = pm.Affiliator()
+        g_pool.eye_movements = pm.Affiliator()
 
         def set_data_confidence(new_confidence):
             g_pool.min_data_confidence = new_confidence
@@ -307,21 +337,11 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             notification["_notify_time_"] = time() + 0.8
             g_pool.ipc_pub.notify(notification)
 
-        def open_plugin(plugin):
-            if plugin == "Select to load":
-                return
-            g_pool.plugins.add(plugin)
-
-        def purge_plugins():
-            for p in g_pool.plugins:
-                if p.__class__ in user_plugins:
-                    p.alive = False
-            g_pool.plugins.clean()
-
         def do_export(_):
             left_idx = g_pool.seek_control.trim_left
             right_idx = g_pool.seek_control.trim_right
             export_range = left_idx, right_idx + 1  # exclusive range.stop
+            export_ts_window = pm.exact_window(g_pool.timestamps, (left_idx, right_idx))
 
             export_dir = os.path.join(g_pool.rec_dir, "exports")
             export_dir = next_export_sub_dir(export_dir)
@@ -331,7 +351,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
 
             export_info = {
                 "Player Software Version": str(g_pool.version),
-                "Data Format Version": meta_info["Data Format Version"],
+                "Data Format Version": meta_info.min_player_version,
                 "Export Date": strftime("%d.%m.%Y", localtime()),
                 "Export Time": strftime("%H:%M:%S", localtime()),
                 "Frame Index Range:": g_pool.seek_control.get_frame_index_trim_range_string(),
@@ -344,6 +364,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             notification = {
                 "subject": "should_export",
                 "range": export_range,
+                "ts_window": export_ts_window,
                 "export_dir": export_dir,
             }
             g_pool.ipc_pub.notify(notification)
@@ -406,16 +427,15 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             )
         )
         general_settings.append(
-            ui.Info_Text("Player Version: {}".format(g_pool.version))
+            ui.Info_Text(f"Minimum Player Version: {meta_info.min_player_version}")
+        )
+        general_settings.append(ui.Info_Text(f"Player Version: {g_pool.version}"))
+        general_settings.append(
+            ui.Info_Text(f"Recording Software: {meta_info.recording_software_name}")
         )
         general_settings.append(
             ui.Info_Text(
-                "Capture Version: {}".format(meta_info["Capture Software Version"])
-            )
-        )
-        general_settings.append(
-            ui.Info_Text(
-                "Data Format Version: {}".format(meta_info["Data Format Version"])
+                f"Recording Software Version: {meta_info.recording_software_version}"
             )
         )
 
@@ -482,9 +502,9 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             ("Vis_Circle", {}),
             ("System_Graphs", {}),
             ("System_Timelines", {}),
-            ("Video_Export_Launcher", {}),
+            ("World_Video_Exporter", {}),
             ("Pupil_From_Recording", {}),
-            ("Gaze_From_Recording", {}),
+            ("GazeFromRecording", {}),
             ("Audio_Playback", {}),
         ]
 
@@ -559,7 +579,9 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
                             }
                         )
 
-        while not glfw.glfwWindowShouldClose(main_window):
+        while (
+            not glfw.glfwWindowShouldClose(main_window) and not process_was_interrupted
+        ):
 
             # fetch newest notifications
             new_notifications = []
@@ -589,6 +611,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
             g_pool.plugins.clean()
 
             glfw.glfwMakeContextCurrent(main_window)
+            glfw.glfwPollEvents()
             # render visual feedback from loaded plugins
             if gl_utils.is_window_visible(main_window):
 
@@ -617,22 +640,24 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
                     pos = x * hdpi_factor, y * hdpi_factor
                     pos = normalize(pos, g_pool.camera_render_size)
                     pos = denormalize(pos, g_pool.capture.frame_size)
-                    for p in g_pool.plugins:
-                        p.on_click(pos, button, action)
+
+                    for plugin in g_pool.plugins:
+                        if plugin.on_click(pos, button, action):
+                            break
 
                 for key, scancode, action, mods in user_input.keys:
-                    for p in g_pool.plugins:
-                        p.on_key(key, scancode, action, mods)
+                    for plugin in g_pool.plugins:
+                        if plugin.on_key(key, scancode, action, mods):
+                            break
 
                 for char_ in user_input.chars:
-                    for p in g_pool.plugins:
-                        p.on_char(char_)
+                    for plugin in g_pool.plugins:
+                        if plugin.on_char(char_):
+                            break
 
                 # present frames at appropriate speed
                 g_pool.seek_control.wait(events["frame"].timestamp)
                 glfw.glfwSwapBuffers(main_window)
-
-            glfw.glfwPollEvents()
 
         session_settings["loaded_plugins"] = g_pool.plugins.get_initializers()
         session_settings["min_data_confidence"] = g_pool.min_data_confidence
@@ -658,7 +683,7 @@ def player(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_versio
         g_pool.gui.terminate()
         glfw.glfwDestroyWindow(main_window)
 
-    except:
+    except Exception:
         import traceback
 
         trace = traceback.format_exc()
@@ -692,7 +717,6 @@ def player_drop(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_v
     logger = logging.getLogger(__name__)
 
     try:
-
         import glfw
         import gl_utils
         from OpenGL.GL import glClearColor
@@ -701,13 +725,33 @@ def player_drop(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_v
         from pyglui.pyfontstash import fontstash
         from pyglui.ui import get_roboto_font_path
         import player_methods as pm
+        from pupil_recording import (
+            assert_valid_recording_type,
+            InvalidRecordingException,
+        )
+        from pupil_recording.update import update_recording
+
+        process_was_interrupted = False
+
+        def interrupt_handler(sig, frame):
+            import traceback
+
+            trace = traceback.format_stack(f=frame)
+            logger.debug(f"Caught signal {sig} in:\n" + "".join(trace))
+            nonlocal process_was_interrupted
+            process_was_interrupted = True
+
+        signal.signal(signal.SIGINT, interrupt_handler)
 
         def on_drop(window, count, paths):
             nonlocal rec_dir
             rec_dir = paths[0].decode("utf-8")
 
         if rec_dir:
-            if not pm.is_pupil_rec_dir(rec_dir):
+            try:
+                assert_valid_recording_type(rec_dir)
+            except InvalidRecordingException as err:
+                logger.error(str(err))
                 rec_dir = None
         # load session persistent settings
         session_settings = Persistent_Dict(
@@ -739,43 +783,68 @@ def player_drop(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_v
         text = "Drop a recording directory onto this window."
         tip = "(Tip: You can drop a recording directory onto the app icon.)"
         # text = "Please supply a Pupil recording directory as first arg when calling Pupil Player."
-        while not glfw.glfwWindowShouldClose(window):
+
+        def display_string(string, font_size, center_y):
+            x = w / 2 * hdpi_factor
+            y = center_y * hdpi_factor
+
+            glfont.set_size(font_size * hdpi_factor)
+
+            glfont.set_blur(10.5)
+            glfont.set_color_float((0.0, 0.0, 0.0, 1.0))
+            glfont.draw_text(x, y, string)
+
+            glfont.set_blur(0.96)
+            glfont.set_color_float((1.0, 1.0, 1.0, 1.0))
+            glfont.draw_text(x, y, string)
+
+        while not glfw.glfwWindowShouldClose(window) and not process_was_interrupted:
 
             fb_size = glfw.glfwGetFramebufferSize(window)
             hdpi_factor = glfw.getHDPIFactor(window)
             gl_utils.adjust_gl_view(*fb_size)
 
             if rec_dir:
-                if pm.is_pupil_rec_dir(rec_dir):
+                try:
+                    assert_valid_recording_type(rec_dir)
                     logger.info("Starting new session with '{}'".format(rec_dir))
                     text = "Updating recording format."
                     tip = "This may take a while!"
-                else:
-                    logger.error("'{}' is not a valid pupil recording".format(rec_dir))
-                    tip = "Oops! That was not a valid recording."
+                except InvalidRecordingException as err:
+                    logger.error(str(err))
+                    if err.recovery:
+                        text = err.reason
+                        tip = err.recovery
+                    else:
+                        text = "Invalid recording"
+                        tip = err.reason
                     rec_dir = None
 
             gl_utils.clear_gl_screen()
-            glfont.set_blur(10.5)
-            glfont.set_color_float((0.0, 0.0, 0.0, 1.0))
-            glfont.set_size(w / 25.0 * hdpi_factor)
-            glfont.draw_text(w / 2 * hdpi_factor, 0.3 * h * hdpi_factor, text)
-            glfont.set_size(w / 30.0 * hdpi_factor)
-            glfont.draw_text(w / 2 * hdpi_factor, 0.4 * h * hdpi_factor, tip)
-            glfont.set_blur(0.96)
-            glfont.set_color_float((1.0, 1.0, 1.0, 1.0))
-            glfont.set_size(w / 25.0 * hdpi_factor)
-            glfont.draw_text(w / 2 * hdpi_factor, 0.3 * h * hdpi_factor, text)
-            glfont.set_size(w / 30.0 * hdpi_factor)
-            glfont.draw_text(w / 2 * hdpi_factor, 0.4 * h * hdpi_factor, tip)
+
+            display_string(text, font_size=51, center_y=216)
+            for idx, line in enumerate(tip.split("\n")):
+                tip_font_size = 42
+                center_y = 288 + tip_font_size * idx * 1.2
+                display_string(line, font_size=tip_font_size, center_y=center_y)
 
             glfw.glfwSwapBuffers(window)
 
             if rec_dir:
                 try:
-                    pm.update_recording_to_recent(rec_dir)
+                    update_recording(rec_dir)
                 except AssertionError as err:
                     logger.error(str(err))
+                    tip = "Oops! There was an error updating the recording."
+                    rec_dir = None
+                except InvalidRecordingException as err:
+                    logger.error(str(err))
+                    if err.recovery:
+                        text = err.reason
+                        tip = err.recovery
+                    else:
+                        text = "Invalid recording"
+                        tip = err.reason
                     rec_dir = None
                 else:
                     glfw.glfwSetWindowShouldClose(window, True)
@@ -790,7 +859,7 @@ def player_drop(rec_dir, ipc_pub_url, ipc_sub_url, ipc_push_url, user_dir, app_v
                 {"subject": "player_process.should_start", "rec_dir": rec_dir}
             )
 
-    except:
+    except Exception:
         import traceback
 
         trace = traceback.format_exc()

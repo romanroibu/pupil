@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -29,7 +29,9 @@ import os
 from bisect import bisect_left, bisect_right
 from collections import deque
 from itertools import chain
+from types import SimpleNamespace
 
+import cv2
 import msgpack
 import numpy as np
 from pyglui import ui
@@ -38,22 +40,22 @@ from pyglui.pyfontstash import fontstash
 from scipy.spatial.distance import pdist
 
 import background_helper as bh
-import cv2
 import file_methods as fm
 import player_methods as pm
 from methods import denormalize
 from plugin import Analysis_Plugin_Base
+from eye_movement.utils import can_use_3d_gaze_mapping
 
 logger = logging.getLogger(__name__)
-
-
-class Empty(object):
-    pass
 
 
 class Fixation_Detector_Base(Analysis_Plugin_Base):
     icon_chr = chr(0xEC03)
     icon_font = "pupil_icons"
+
+    @classmethod
+    def parse_pretty_class_name(cls) -> str:
+        return "Fixation Detector"
 
 
 def fixation_from_data(dispersion, method, base_data, timestamps=None):
@@ -172,7 +174,7 @@ def detect_fixations(
         logger.warning("No data available to find fixations")
         return "Fixation detection complete", ()
 
-    use_pupil = "gaze_normal_3d" in gaze_data[0] or "gaze_normals_3d" in gaze_data[0]
+    use_pupil = can_use_3d_gaze_mapping(gaze_data)
     logger.info(
         "Starting fixation detection using {} data...".format(
             "3d" if use_pupil else "2d"
@@ -264,9 +266,9 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
     def __init__(
         self,
         g_pool,
-        max_dispersion=3.0,
-        min_duration=300,
-        max_duration=1000,
+        max_dispersion=1.50,
+        min_duration=80,
+        max_duration=220,
         show_fixations=True,
     ):
         super().__init__(g_pool)
@@ -438,7 +440,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
         elif notification["subject"] == "fixation_detector.should_recalculate":
             self._classify()
         elif notification["subject"] == "should_export":
-            self.export_fixations(notification["range"], notification["export_dir"])
+            self.export_fixations(notification["ts_window"], notification["export_dir"])
 
     def _classify(self):
         """
@@ -452,7 +454,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
 
         gaze_data = [gp.serialized for gp in self.g_pool.gaze_positions]
 
-        cap = Empty()
+        cap = SimpleNamespace()
         cap.frame_size = self.g_pool.capture.frame_size
         cap.intrinsics = self.g_pool.capture.intrinsics
         cap.timestamps = self.g_pool.capture.timestamps
@@ -468,7 +470,9 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
         self.fixation_data = deque()
         self.fixation_start_ts = deque()
         self.fixation_stop_ts = deque()
-        self.bg_task = bh.IPC_Logging_Task_Proxy('Fixation detection', detect_fixations, args=generator_args)
+        self.bg_task = bh.IPC_Logging_Task_Proxy(
+            "Fixation detection", detect_fixations, args=generator_args
+        )
 
     def recent_events(self, events):
         if self.bg_task:
@@ -610,7 +614,7 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
             " ".join(["{}".format(gp["timestamp"]) for gp in fixation["base_data"]]),
         )
 
-    def export_fixations(self, export_range, export_dir):
+    def export_fixations(self, export_window, export_dir):
         """
         between in and out mark
 
@@ -627,7 +631,6 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
             logger.warning("No fixations in this recording nothing to export")
             return
 
-        export_window = pm.exact_window(self.g_pool.timestamps, export_range)
         fixations_in_section = self.g_pool.fixations.by_ts_window(export_window)
 
         with open(
@@ -650,9 +653,8 @@ class Offline_Fixation_Detector(Fixation_Detector_Base):
             csv_writer.writerow(
                 ("max_dispersion", "{:0.3f} deg".format(self.max_dispersion))
             )
-            csv_writer.writerow(
-                ("min_duration", "{:0.3f} sec".format(self.min_duration))
-            )
+            csv_writer.writerow(("min_duration", "{:.0f} ms".format(self.min_duration)))
+            csv_writer.writerow(("max_duration", "{:.0f} ms".format(self.max_duration)))
             csv_writer.writerow((""))
             csv_writer.writerow(("fixation_count", len(fixations_in_section)))
             logger.info("Created 'fixation_report.csv' file.")
@@ -705,7 +707,7 @@ class Fixation_Detector(Fixation_Detector_Base):
                 self.reset_history()
                 return
 
-            age_threshold = ts_newest - self.min_duration / 1000.
+            age_threshold = ts_newest - self.min_duration / 1000.0
             # pop elements until only one element below the age threshold remains:
             while self.history[1]["timestamp"] < age_threshold:
                 self.history.popleft()  # remove outdated gaze points
@@ -714,7 +716,7 @@ class Fixation_Detector(Fixation_Detector_Base):
             pass
 
         gaze_3d = [gp for gp in self.history if "3d" in gp["base_data"][0]["method"]]
-        use_pupil = len(gaze_3d) > 0.8 * len(self.history)
+        use_pupil = can_use_3d_gaze_mapping(self.history)
 
         base_data = gaze_3d if use_pupil else self.history
 

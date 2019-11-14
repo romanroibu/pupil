@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -11,8 +11,10 @@ See COPYING and COPYING.LESSER for license details.
 
 import logging
 import multiprocessing as mp
-import zmq
+import signal
 from ctypes import c_bool
+
+import zmq
 
 import zmq_tools
 
@@ -26,17 +28,21 @@ class EarlyCancellationError(Exception):
 class Task_Proxy:
     """Future like object that runs a given generator in the background and returns is able to return the results incrementally"""
 
-    def __init__(self, name, generator, args=(), kwargs={}):
+    def __init__(self, name, generator, args=(), kwargs={}, context=...):
         super().__init__()
+        if context is ...:
+            context = mp.get_context()
 
-        self._should_terminate_flag = mp.Value(c_bool, 0)
+        self._should_terminate_flag = context.Value(c_bool, 0)
         self._completed = False
         self._canceled = False
 
-        pipe_recv, pipe_send = mp.Pipe(False)
-        wrapper_args = self._prepare_wrapper_args(pipe_send, self._should_terminate_flag, generator)
+        pipe_recv, pipe_send = context.Pipe(False)
+        wrapper_args = self._prepare_wrapper_args(
+            pipe_send, self._should_terminate_flag, generator
+        )
         wrapper_args.extend(args)
-        self.process = mp.Process(
+        self.process = context.Process(
             target=self._wrapper, name=name, args=wrapper_args, kwargs=kwargs
         )
         self.process.daemon = True
@@ -50,6 +56,16 @@ class Task_Proxy:
         `Task_Proxy.fetch()`. This allows users to handle failure gracefully
         as well as raising their own exceptions in the background task.
         """
+
+        def interrupt_handler(sig, frame):
+            import traceback
+
+            trace = traceback.format_stack(f=frame)
+            logger.debug(f"Caught signal {sig} in:\n" + "".join(trace))
+            # NOTE: Interrupt is handled in world/service/player which are responsible
+            # for shutting down the background process properly
+
+        signal.signal(signal.SIGINT, interrupt_handler)
         try:
             self._change_logging_behavior()
             logger.debug("Entering _wrapper")
@@ -71,7 +87,7 @@ class Task_Proxy:
             logger.debug("Exiting _wrapper")
 
     def _prepare_wrapper_args(self, *args):
-        return args
+        return list(args)
 
     def _change_logging_behavior(self):
         pass
@@ -118,10 +134,6 @@ class Task_Proxy:
     def canceled(self):
         return self._canceled
 
-    def __del__(self):
-        self.cancel(timeout=0.1)
-        self.process = None
-
 
 class IPC_Logging_Task_Proxy(Task_Proxy):
     push_url = None
@@ -129,7 +141,9 @@ class IPC_Logging_Task_Proxy(Task_Proxy):
     def _prepare_wrapper_args(self, *args):
         return [*args, self.push_url]
 
-    def _wrapper(self, pipe, _should_terminate_flag, generator, push_url, *args, **kwargs):
+    def _wrapper(
+        self, pipe, _should_terminate_flag, generator, push_url, *args, **kwargs
+    ):
         self.push_url = push_url
         super()._wrapper(pipe, _should_terminate_flag, generator, *args, **kwargs)
 

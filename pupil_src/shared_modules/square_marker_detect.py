@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -153,7 +153,7 @@ def correct_gradient(gray_img, r):
     try:
         gradient = int(gray_img[outer]) - int(gray_img[inner])
         return gradient > 20  # at least 20 shades darker inside
-    except:
+    except Exception:
         # px outside of img frame, let the other method check
         return True
 
@@ -165,9 +165,9 @@ def detect_markers(
         gray_img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, aperture, 9
     )
 
-    _img, contours, hierarchy = cv2.findContours(
+    *_, contours, hierarchy = cv2.findContours(
         edges, mode=cv2.RETR_TREE, method=cv2.CHAIN_APPROX_SIMPLE, offset=(0, 0)
-    )  # TC89_KCOS
+    )
 
     # remove extra encapsulation
     hierarchy = hierarchy[0]
@@ -396,7 +396,7 @@ def detect_markers_robust(
         gray_img = 255 - gray_img
 
     global tick
-    if not tick:
+    if tick == 0:
         tick = true_detect_every_frame
         new_markers = detect_markers(
             gray_img, grid_size, min_marker_perimeter, aperture, visualize

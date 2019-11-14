@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -9,29 +9,23 @@ See COPYING and COPYING.LESSER for license details.
 ---------------------------------------------------------------------------~(*)
 """
 
-"""
-av_writer module uses PyAV (ffmpeg or libav backend) to write AV files.
-requires:
-    -
-"""
-
-import os, sys, platform
-import av
-from av.packet import Packet
-
-import numpy as np
-from time import time
-from fractions import Fraction
+import abc
 
 # logging
 import logging
+import multiprocessing as mp
+import os
+import typing as T
+from fractions import Fraction
+
+import av
+import numpy as np
+from av.packet import Packet
+
+import audio_utils
+from video_capture.utils import Video
 
 logger = logging.getLogger(__name__)
-
-
-from threading import Thread
-from threading import Event
-import multiprocessing as mp
 
 
 """
@@ -62,102 +56,214 @@ to be valid and should only now be accesed.
 """
 
 
-def write_timestamps(file_loc, timestamps):
+def write_timestamps(file_loc, timestamps, output_format="npy"):
+    """
+    Attritbutes:
+        output_format (str): Output file format. Available values:
+        - "npy": numpy array format (default)
+        - "csv": csv file export
+        - "all": Exports in all of the above formats
+    """
     directory, video_file = os.path.split(file_loc)
     name, ext = os.path.splitext(video_file)
-    ts_file = "{}_timestamps.npy".format(name)
+    ts_file = "{}_timestamps".format(name)
     ts_loc = os.path.join(directory, ts_file)
     ts = np.array(timestamps)
-    np.save(ts_loc, ts)
+    if output_format not in ("npy", "csv", "all"):
+        raise ValueError("Unknown timestamp output format `{}`".format(output_format))
+    if output_format in ("npy", "all"):
+        np.save(ts_loc + ".npy", ts)
+    if output_format in ("csv", "all"):
+        output_video = Video(file_loc)
+        if not output_video.is_valid:
+            logger.error(f"Failed to extract PTS frome exported video {file_loc}")
+            return
+        pts = output_video.pts
+        ts_pts = np.vstack((ts, pts)).T
+        np.savetxt(
+            ts_loc + ".csv",
+            ts_pts,
+            fmt=["%f", "%i"],
+            delimiter=",",
+            header="timestamps [seconds],pts",
+        )
 
 
-class AV_Writer(object):
-    """
-    AV_Writer class
-        - file_loc: path to file out
-        - video_stream:
+class AV_Writer(abc.ABC):
+    def __init__(self, output_file_path: str, start_time_synced: int):
+        """
+        A generic writer for frames to a file using pyAV.
 
-    We are creating a
-    """
+        output_file_path: File to write frames to.
+        start_time_synced: Start time of the recording.
+            Will be used to calculate positions of frames (pts).
+        """
 
-    def __init__(
-        self,
-        file_loc,
-        fps=30,
-        video_stream={"codec": "mpeg4", "bit_rate": 15000 * 10e3},
-        audio_loc=None,
-        use_timestamps=False,
-    ):
-        super().__init__()
-        self.use_timestamps = use_timestamps
         self.timestamps = []
-        # the approximate capture rate.
-        self.fps = int(fps)
-        directory, video_file = os.path.split(file_loc)
+        self.start_time = start_time_synced
+        self.last_video_pts = float("-inf")
+
+        # always write with highest resolution for mp4
+        # NOTE: libav might lower the resolution on saving, if possible
+        self.time_base = Fraction(1, 65535)
+
+        self.output_file_path = output_file_path
+        directory, video_file = os.path.split(output_file_path)
         name, ext = os.path.splitext(video_file)
 
-        if ext not in (".mp4", ".mov", ".mkv"):
+        if ext not in self.supported_extensions:
             logger.warning(
-                "media file container should be mp4 or mov. Using a different container is risky."
+                f"Opening media file writer for {ext}. "
+                f"Only {self.supported_extensions} are supported! "
+                "Using a different container is risky!"
             )
 
-        self.file_loc = file_loc
-        self.container = av.open(self.file_loc, "w")
-        logger.debug("Opened '{}' for writing.".format(self.file_loc))
+        self.container = av.open(output_file_path, "w")
+        logger.debug("Opened '{}' for writing.".format(output_file_path))
 
-        if self.use_timestamps:
-            self.time_base = Fraction(1, 65535)  # highest resolution for mp4
-        else:
-            self.time_base = Fraction(1000, self.fps * 1000)  # timebase is fps
-
-        self.video_stream = self.container.add_stream(
-            video_stream["codec"], 1 / self.time_base
-        )
-        self.video_stream.bit_rate = video_stream["bit_rate"]
-        self.video_stream.bit_rate_tolerance = video_stream["bit_rate"] / 20
-        self.video_stream.thread_count = max(1, mp.cpu_count() - 1)
-        # self.video_stream.pix_fmt = "yuv420p"
-
-        if audio_loc:
-            audio_dir = os.path.split(audio_loc)[0]
-            audio_ts_loc = os.path.join(audio_dir, "audio_timestamps.npy")
-            audio_exists = os.path.exists(audio_loc) and os.path.exists(audio_ts_loc)
-            if audio_exists:
-                self.audio_rec = av.open(audio_loc)
-                self.audio_ts = np.load(audio_ts_loc)
-                self.audio_export = self.container.add_stream(
-                    template=self.audio_rec.streams.audio[0]
-                )
-            else:
-                logger.warning("Could not mux audio. File not found.")
-                self.audio_export = False
-        else:
-            self.audio_export = False
         self.configured = False
-        self.start_time = None
+        self.video_stream = self.container.add_stream(
+            codec_name=self.codec, rate=1 / self.time_base
+        )
 
-        self.current_frame_idx = 0
-        self.audio_packets_decoded = 0
+        # TODO: Where does this bit-rate come from? Seems like an unreasonable
+        # value. Also 10e3 == 1e4, which makes this even weirder!
+        BIT_RATE = 15000 * 10e3
+        self.video_stream.bit_rate = BIT_RATE
+        self.video_stream.bit_rate_tolerance = BIT_RATE / 20
+        self.video_stream.thread_count = max(1, mp.cpu_count() - 1)
+
+        self.closed = False
 
     def write_video_frame(self, input_frame):
+        """
+        Write a frame to the video_stream.
+
+        For subclasses, implement self.encode_frame().
+        """
+        if self.closed:
+            logger.warning("Container was closed already!")
+            return
+
         if not self.configured:
             self.video_stream.height = input_frame.height
             self.video_stream.width = input_frame.width
             self.configured = True
-            self.start_time = input_frame.timestamp
-            if input_frame.yuv_buffer is not None:
-                self.frame = av.VideoFrame(
-                    input_frame.width, input_frame.height, "yuv422p"
-                )
-            else:
-                self.frame = av.VideoFrame(
-                    input_frame.width, input_frame.height, "bgr24"
-                )
-            if self.use_timestamps:
-                self.frame.time_base = self.time_base
-            else:
-                self.frame.time_base = Fraction(1, self.fps)
+            self.on_first_frame(input_frame)
 
+        ts = input_frame.timestamp
+
+        if ts < self.start_time:
+            # This can happen, because we might have a frame already in the
+            # pipeline when starting the recording. We should skip this frame
+            # then, as the processes are not yet synced.
+            logger.debug("Skipping frame that arrived before sync time.")
+            return
+
+        if self.timestamps:
+            last_ts = self.timestamps[-1]
+            if ts < last_ts:
+                self.release()
+                raise ValueError(
+                    "Non-monotonic timestamps!"
+                    f"Last timestamp: {last_ts}. Given timestamp: {ts}"
+                )
+
+        pts = int((input_frame.timestamp - self.start_time) / self.time_base)
+
+        # ensure strong monotonic pts
+        pts = max(pts, self.last_video_pts + 1)
+
+        # TODO: Use custom Frame wrapper class, that wraps backend-specific frames.
+        # This way we could just attach the pts here to the frame.
+        # Currently this will fail e.g. for av.VideoFrame.
+        video_packed_encoded = False
+        for packet in self.encode_frame(input_frame, pts):
+            if packet.stream is self.video_stream:
+                if video_packed_encoded:
+                    # NOTE: Assumption: Each frame is encoded into a single packet!
+                    # This is required for the frame.pts == packet.pts assumption below.
+                    logger.warning("Single frame yielded more than one packet")
+                video_packed_encoded = True
+            self.container.mux(packet)
+
+        if not video_packed_encoded:
+            logger.warning(f"Encoding frame {input_frame.index} failed!")
+            return
+
+        self.last_video_pts = pts
+        self.timestamps.append(ts)
+
+    def close(self, timestamp_export_format="npy"):
+        """Close writer, triggering stream and timestamp save."""
+
+        if self.closed:
+            logger.warning("Trying to close container multiple times!")
+            return
+
+        if self.configured:
+            # at least one frame has been written, flush stream
+            for packet in self.video_stream.encode(None):
+                self.container.mux(packet)
+
+        self.container.close()
+        self.closed = True
+
+        if self.configured and timestamp_export_format is not None:
+            # Requires self.container to be closed since we extract pts
+            # from the exported video file.
+            write_timestamps(
+                self.output_file_path, self.timestamps, timestamp_export_format
+            )
+
+    def release(self):
+        """Close writer, triggering stream and timestamp save."""
+        self.close()
+
+    def on_first_frame(self, input_frame) -> None:
+        """
+        Will be called once for the first frame.
+
+        Overwrite to do additional setup.
+        """
+        pass
+
+    @abc.abstractmethod
+    def encode_frame(self, input_frame, pts: int) -> T.Iterator[Packet]:
+        """Encode a frame into one or multiple av packets with given pts."""
+
+    @property
+    @abc.abstractmethod
+    def supported_extensions(self) -> T.Tuple[str]:
+        """Supported file extensions (starting with '.')."""
+
+    @property
+    @abc.abstractmethod
+    def codec(self) -> str:
+        """Desired video stream codec."""
+
+
+class MPEG_Writer(AV_Writer):
+    """AV_Writer with MPEG4 encoding."""
+
+    @property
+    def supported_extensions(self):
+        return (".mp4", ".mov", ".mkv")
+
+    @property
+    def codec(self):
+        return "mpeg4"
+
+    def on_first_frame(self, input_frame) -> None:
+        # setup av frame once to use as buffer throughout the process
+        if input_frame.yuv_buffer is not None:
+            pix_format = "yuv422p"
+        else:
+            pix_format = "bgr24"
+        self.frame = av.VideoFrame(input_frame.width, input_frame.height, pix_format)
+        self.frame.time_base = self.time_base
+
+    def encode_frame(self, input_frame, pts: int) -> T.Iterator[Packet]:
         if input_frame.yuv_buffer is not None:
             y, u, v = input_frame.yuv422
             self.frame.planes[0].update(y)
@@ -166,254 +272,94 @@ class AV_Writer(object):
         else:
             self.frame.planes[0].update(input_frame.img)
 
-        if self.use_timestamps:
-            self.frame.pts = int(
-                (input_frame.timestamp - self.start_time) / self.time_base
-            )
-        else:
-            # our timebase is 1/30  so a frame idx is the correct pts for an fps recorded video.
-            self.frame.pts = self.current_frame_idx
-        # send frame of to encoder
-        for packet in self.video_stream.encode(self.frame):
-            self.container.mux(packet)
-        self.current_frame_idx += 1
-        self.timestamps.append(input_frame.timestamp)
-        if self.audio_export:
-            for audio_packet in self.audio_rec.demux():
-                if self.audio_packets_decoded >= len(self.audio_ts):
-                    logger.debug(
-                        "More audio frames decoded than there are timestamps: {} > {}".format(
-                            self.audio_packets_decoded, len(self.audio_ts)
-                        )
-                    )
-                    break
-                audio_pts = int(
-                    (self.audio_ts[self.audio_packets_decoded] - self.start_time)
-                    / self.audio_export.time_base
-                )
-                audio_packet.pts = audio_pts
-                audio_packet.dts = audio_pts
-                audio_packet.stream = self.audio_export
-                self.audio_packets_decoded += 1
+        self.frame.pts = pts
 
-                if audio_pts * self.audio_export.time_base < 0:
-                    logger.debug(
-                        "Seeking: {} -> {}".format(
-                            audio_pts * self.audio_export.time_base, self.start_time
-                        )
-                    )
-                    continue  # seek to start_time
-
-                self.container.mux(audio_packet)
-                if (
-                    audio_pts * self.audio_export.time_base
-                    > self.frame.pts * self.time_base
-                ):
-                    break  # wait for next image
-
-    def close(self):
-        # only flush encoder if there has been at least one frame
-        if self.configured:
-            for packet in self.video_stream.encode(None):
-                self.container.mux(packet)
-
-        self.container.close()  # throws RuntimeError if no frames were written
-        write_timestamps(self.file_loc, self.timestamps)
-
-    def release(self):
-        self.close()
+        yield from self.video_stream.encode(self.frame)
 
 
-class JPEG_Writer(object):
-    """
-    PyAV based jpeg writer.
-    """
+class JPEG_Writer(AV_Writer):
+    """AV_Writer with MJPEG encoding."""
 
-    def __init__(self, file_loc, fps=30):
-        super().__init__()
-        # the approximate capture rate.
-        self.fps = int(fps)
-        self.time_base = Fraction(1000, self.fps * 1000)
-        self.timestamps = []
-        directory, video_file = os.path.split(file_loc)
-        name, ext = os.path.splitext(video_file)
+    @property
+    def supported_extensions(self):
+        return (".mp4",)
 
-        if ext not in (".mp4"):
-            logger.warning(
-                "media file container should be mp4. Using a different container is risky."
-            )
+    @property
+    def codec(self):
+        return "mjpeg"
 
-        self.file_loc = file_loc
-        self.container = av.open(self.file_loc, "w")
-        logger.debug("Opened '{}' for writing.".format(self.file_loc))
-
-        self.video_stream = self.container.add_stream("mjpeg", 1 / self.time_base)
+    def on_first_frame(self, input_frame) -> None:
         self.video_stream.pix_fmt = "yuvj422p"
-        self.video_stream.time_base = self.time_base
-        self.configured = False
-        self.frame_count = 0
 
-        self.write_video_frame_compressed = self.write_video_frame
-
-    def write_video_frame(self, input_frame):
-        if not self.configured:
-            self.video_stream.height = input_frame.height
-            self.video_stream.width = input_frame.width
-            self.configured = True
-
+    def encode_frame(self, input_frame, pts: int) -> T.Iterator[Packet]:
+        # for JPEG we only get a single packet per frame
         packet = Packet()
+        packet.stream = self.video_stream
         packet.payload = input_frame.jpeg_buffer
-        # we are setting the packet pts manually this uses a different timebase av.frame!
         packet.time_base = self.time_base
-        packet.dts = int(self.frame_count / self.time_base / self.fps)
-        packet.pts = int(self.frame_count / self.time_base / self.fps)
-        self.frame_count += 1
-        self.container.mux(packet)
-        self.timestamps.append(input_frame.timestamp)
-
-    def close(self):
-        self.container.close()  # throws RuntimeError if no frames were written
-        write_timestamps(self.file_loc, self.timestamps)
-
-    def release(self):
-        self.close()
+        packet.pts = pts
+        # TODO: check if we still need dts here, as they were removed from MPEG_Writer
+        packet.dts = pts
+        yield packet
 
 
-def format_time(time, time_base):
-    if time is None:
-        return "None"
-    return "{:.3f}s ({} or {}/{})".format(
-        time_base * time,
-        time_base * time,
-        time_base.numerator * time,
-        time_base.denominator,
-    )
+class MPEG_Audio_Writer(MPEG_Writer):
+    """Extension of MPEG_Writer with audio support."""
 
+    def __init__(self, *args, audio_dir: str, **kwargs):
+        super().__init__(*args, **kwargs)
 
-def rec_thread(file_loc, in_container, audio_src, should_close):
-    # print sys.modules['av']
-    # import av
-    if not in_container:
-        # create in container
-        if platform.system() == "Darwin":
-            in_container = av.open("none:{}".format(audio_src), format="avfoundation")
-        elif platform.system() == "Linux":
-            in_container = av.open("hw:{}".format(audio_src), format="alsa")
-
-    in_stream = None
-
-    # print len(in_container.streams), 'stream(s):'
-    for i, stream in enumerate(in_container.streams):
-
-        if stream.type == "audio":
-            # print '\t\taudio:'
-            # print '\t\t\tformat:', stream.format
-            # print '\t\t\tchannels: %s' % stream.channels
-            in_stream = stream
-            break
-
-    if in_stream is None:
-        # logger.error("No input audio stream found.")
-        return
-
-    # create out container
-    out_container = av.open(file_loc, "w")
-    # logger.debug("Opened '%s' for writing."%file_loc)
-    out_stream = out_container.add_stream(template=in_stream)
-
-    for packet in in_container.demux(in_stream):
-        # for frame in packet.decode():
-        #     packet = out_stream.encode(frame)
-        #     if packet:
-        # print '%r' %packet
-        # print '\tduration: %s' % format_time(packet.duration, packet.stream.time_base)
-        # print '\tpts: %s' % format_time(packet.pts, packet.stream.time_base)
-        # print '\tdts: %s' % format_time(packet.dts, packet.stream.time_base)
-        out_container.mux(packet)
-        if should_close.is_set():
-            break
-
-    out_container.close()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
-    from audio_capture import Audio_Capture
-
-    cap = Audio_Capture("test.wav", "default")
-
-    import time
-
-    time.sleep(5)
-    cap.cleanup()
-    # mic device
-    exit()
-
-    # container = av.open('hw:0',format="alsa")
-    container = av.open("1:0", format="avfoundation")
-    print("container:", container)
-    print("\tformat:", container.format)
-    print("\tduration:", float(container.duration) / av.time_base)
-    print("\tmetadata:")
-    for k, v in sorted(container.metadata.items()):
-        print("\t\t{}: {!r}".format(k, v))
-
-    print(len(container.streams), "stream(s):")
-    audio_stream = None
-    for i, stream in enumerate(container.streams):
-
-        print("\t{!r}".format(stream))
-        print("\t\ttime_base: {!r}".format(stream.time_base))
-        print("\t\trate: {!r}".format(stream.rate))
-        print("\t\tstart_time: {!r}".format(stream.start_time))
-        print("\t\tduration: {}".format(format_time(stream.duration, stream.time_base)))
-        print("\t\tbit_rate: {}".format(stream.bit_rate))
-        print("\t\tbit_rate_tolerance: {}".format(stream.bit_rate_tolerance))
-
-        if stream.type == b"audio":
-            print("\t\taudio:")
-            print("\t\t\tformat:", stream.format)
-            print("\t\t\tchannels: {}".format(stream.channels))
-            audio_stream = stream
-            break
-        elif stream.type == "container":
-            print("\t\tcontainer:")
-            print("\t\t\tformat:", stream.format)
-            print("\t\t\taverage_rate: {!r}".format(stream.average_rate))
-
-        print("\t\tmetadata:")
-        for k, v in sorted(stream.metadata.items()):
-            print("\t\t\t{}: {!r}".format(k, v))
-
-    if not audio_stream:
-        exit()
-
-    # file contianer:
-    out_container = av.open("test.wav", "w")
-    out_stream = out_container.add_stream(template=audio_stream)
-    # out_stream.rate = 44100
-    for i, packet in enumerate(container.demux(audio_stream)):
-        # for frame in packet.decode():
-        #     packet = out_stream.encode(frame)
-        #     if packet:
-        print("{!r}".format(packet))
-        print(
-            "\tduration: {}".format(
-                format_time(packet.duration, packet.stream.time_base)
+        try:
+            self.audio = audio_utils.load_audio(audio_dir)
+            self.audio_export_stream = self.container.add_stream(
+                template=self.audio.stream
             )
-        )
-        print("\tpts: {}".format(format_time(packet.pts, packet.stream.time_base)))
-        print("\tdts: {}".format(format_time(packet.dts, packet.stream.time_base)))
-        out_container.mux(packet)
-        if i > 1000:
-            break
+        except audio_utils.NoAudioLoadedError:
+            logger.warning("Could not mux audio. File not found.")
+            self.audio = None
 
-    out_container.close()
+        self.num_audio_packets_decoded = 0
+        self.last_audio_pts = float("-inf")
 
-    # import cProfile,subthread,os
-    # cProfile.runctx("test()",{},locals(),"av_writer.pstats")
-    # loc = os.path.abspath(_file__).rsplit('pupil_src', 1)
-    # gprof2dot_loc = os.path.oin(loc[0], 'pupil_src', 'shared_modules','gprof2dot.py')
-    # subthread.call("python "+gprof2dot_loc+" -f pstats av_writer.pstats | dot -Tpng -o av_writer.png", shell=True)
-    # print "created cpu time graph for av_writer thread. Please check out the png next to the av_writer.py file"
+    def encode_frame(self, input_frame, pts: int) -> T.Iterator[Packet]:
+        # encode video packets from AV_Writer base first
+        yield from super().encode_frame(input_frame, pts)
+
+        if self.audio is None:
+            return
+
+        # encode audio packets
+        for audio_packet in self.audio.container.demux():
+            if self.num_audio_packets_decoded >= len(self.audio.timestamps):
+                logger.debug(
+                    "More audio frames decoded than there are timestamps: {} > {}".format(
+                        self.num_audio_packets_decoded, len(self.audio.timestamps)
+                    )
+                )
+                break
+            audio_pts = int(
+                (
+                    self.audio.timestamps[self.num_audio_packets_decoded]
+                    - self.start_time
+                )
+                / self.audio_export_stream.time_base
+            )
+            # ensure strong monotonic pts
+            pts = max(pts, self.last_audio_pts + 1)
+            self.last_audio_pts = pts
+
+            audio_packet.pts = audio_pts
+            audio_packet.dts = audio_pts
+            audio_packet.stream = self.audio_export_stream
+            self.num_audio_packets_decoded += 1
+
+            audio_ts = audio_pts * self.audio_export_stream.time_base
+            if audio_ts < 0:
+                logger.debug("Seeking: {} -> {}".format(audio_ts, self.start_time))
+                continue  # seek to start_time
+
+            yield audio_packet
+
+            frame_ts = self.frame.pts * self.time_base
+            if audio_ts > frame_ts:
+                break  # wait for next image

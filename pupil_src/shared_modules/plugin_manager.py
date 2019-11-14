@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -60,7 +60,7 @@ class Plugin_Manager(System_Plugin_Base):
 
             return ui.Switch(
                 p.__name__,
-                label=p.__name__.replace("_", " "),
+                label=p.parse_pretty_class_name(),
                 setter=setter,
                 getter=getter,
             )

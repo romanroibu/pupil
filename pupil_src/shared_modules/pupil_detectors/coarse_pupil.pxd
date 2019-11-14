@@ -1,13 +1,13 @@
-'''
+"""
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
 See COPYING and COPYING.LESSER for license details.
 ---------------------------------------------------------------------------~(*)
-'''
+"""
 
 cimport cython
 import math
@@ -66,8 +66,8 @@ cdef inline center_surround(int[:,::1] img, int min_w,int max_w):
     cdef point_t img_size
     img_size.r =  img.shape[0]
     img_size.c =  img.shape[1]
-    cdef int min_h = min_w/3
-    cdef int max_h = max_w/3
+    cdef int min_h = min_w // 3
+    cdef int max_h = max_w // 3
     cdef int h=0, i=0, j=0
     cdef float best_response = -10000
     cdef point_t best_pos

@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -37,8 +37,9 @@ from .fake_backend import Fake_Source, Fake_Manager
 from .file_backend import FileSeekError
 from .file_backend import File_Source, File_Manager
 from .uvc_backend import UVC_Source, UVC_Manager
+from .hmd_streaming import HMD_Streaming_Source
 
-source_classes = [File_Source, UVC_Source, Fake_Source]
+source_classes = [File_Source, UVC_Source, Fake_Source, HMD_Streaming_Source]
 manager_classes = [File_Manager, UVC_Manager, Fake_Manager]
 
 try:
@@ -57,9 +58,13 @@ else:
     source_classes.append(Realsense_Source)
     manager_classes.append(Realsense_Manager)
 
-
-def init_playback_source(g_pool, source_path=None, *args, **kwargs):
-    if source_path is None or os.path.splitext(source_path)[1] == ".fake":
-        return Fake_Source(g_pool, source_path=source_path, *args, **kwargs)
-    else:
-        return File_Source(g_pool, source_path=source_path, *args, **kwargs)
+try:
+    from .realsense2_backend import Realsense2_Source, Realsense2_Manager
+except ImportError as ie:
+    print(ie)
+    logger.info(
+        "Install pyrealsense2 to use the Intel RealSense backend for D400 series cameras"
+    )
+else:
+    source_classes.append(Realsense2_Source)
+    manager_classes.append(Realsense2_Manager)

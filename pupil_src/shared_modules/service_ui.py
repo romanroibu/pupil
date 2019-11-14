@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2017  Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -49,6 +49,8 @@ class Service_UI(System_Plugin_Base):
         self.texture = np.zeros((1, 1, 3), dtype=np.uint8) + 128
 
         glfw.glfwInit()
+        if g_pool.hide_ui:
+            glfw.glfwWindowHint(glfw.GLFW_VISIBLE, 0)  # hide window
         main_window = glfw.glfwCreateWindow(*window_size, "Pupil Service")
         glfw.glfwSetWindowPos(main_window, *window_position)
         glfw.glfwMakeContextCurrent(main_window)
@@ -111,8 +113,8 @@ class Service_UI(System_Plugin_Base):
 
         g_pool.menubar.append(ui.Button("Reset window size", set_window_size))
 
-        pupil_remote_addr = "{}:50020".format(
-            socket.gethostbyname(socket.gethostname())
+        pupil_remote_addr = "{}:{}".format(
+            socket.gethostbyname(socket.gethostname()), g_pool.preferred_remote_port
         )
         g_pool.menubar.append(
             ui.Text_Input(
@@ -137,7 +139,7 @@ class Service_UI(System_Plugin_Base):
                 "eye0_process",
                 label="Detect eye 0",
                 setter=lambda alive: self.start_stop_eye(0, alive),
-                getter=lambda: g_pool.eyes_are_alive[0].value,
+                getter=lambda: g_pool.eye_procs_alive[0].value,
             )
         )
         g_pool.menubar.append(
@@ -145,7 +147,7 @@ class Service_UI(System_Plugin_Base):
                 "eye1_process",
                 label="Detect eye 1",
                 setter=lambda alive: self.start_stop_eye(1, alive),
-                getter=lambda: g_pool.eyes_are_alive[1].value,
+                getter=lambda: g_pool.eye_procs_alive[1].value,
             )
         )
 
@@ -177,6 +179,7 @@ class Service_UI(System_Plugin_Base):
     def update_ui(self):
         if not glfw.glfwWindowShouldClose(self.g_pool.main_window):
             gl_utils.glViewport(0, 0, *self.window_size)
+            glfw.glfwPollEvents()
             self.gl_display()
             try:
                 clipboard = glfw.glfwGetClipboardString(
@@ -193,7 +196,6 @@ class Service_UI(System_Plugin_Base):
                 )
 
             glfw.glfwSwapBuffers(self.g_pool.main_window)
-            glfw.glfwPollEvents()
         else:
             self.notify_all({"subject": "service_process.should_stop"})
 
@@ -205,7 +207,8 @@ class Service_UI(System_Plugin_Base):
         )
 
     def cleanup(self):
-        glfw.glfwRestoreWindow(self.g_pool.main_window)
+        if not self.g_pool.hide_ui:
+            glfw.glfwRestoreWindow(self.g_pool.main_window)
 
         del self.g_pool.menubar[:]
         self.g_pool.gui.remove(self.g_pool.menubar)

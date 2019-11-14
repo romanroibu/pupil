@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -56,7 +56,7 @@ class Vis_Light_Points(Visualizer_Plugin_Base):
         for gaze_point in pts:
             try:
                 overlay[int(gaze_point[1]), int(gaze_point[0])] = 0
-            except:
+            except Exception:
                 pass
 
         out = cv2.distanceTransform(overlay, cv2.DIST_L2, 5)

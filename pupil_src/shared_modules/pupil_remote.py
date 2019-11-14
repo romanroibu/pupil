@@ -1,7 +1,7 @@
 """
 (*)~---------------------------------------------------------------------------
 Pupil - eye tracking platform
-Copyright (C) 2012-2018 Pupil Labs
+Copyright (C) 2012-2019 Pupil Labs
 
 Distributed under the terms of the GNU
 Lesser General Public License (LGPL v3.0).
@@ -39,10 +39,8 @@ class Pupil_Remote(Plugin):
         'PUB_PORT' return the current pub port of the IPC Backbone
         'SUB_PORT' return the current sub port of the IPC Backbone
 
-    Mulitpart messages conforming to pattern:
-        part1: 'notify.' part2: a msgpack serialized dict with at least key 'subject':'my_notification_subject'
-        will be forwared to the Pupil IPC Backbone.
-
+    Mulitpart messages will be forwarded to the Pupil IPC Backbone.For high-frequency
+        messages, it is recommended to use a PUSH socket instead.
 
     A example script for talking with pupil remote below:
         import zmq
@@ -75,7 +73,7 @@ class Pupil_Remote(Plugin):
     icon_chr = chr(0xE307)
     icon_font = "pupil_icons"
 
-    def __init__(self, g_pool, port="50020", host="*", use_primary_interface=True):
+    def __init__(self, g_pool, host="*", use_primary_interface=True):
         super().__init__(g_pool)
         self.order = 0.01  # excecute first
         self.context = g_pool.zmq_ctx
@@ -83,11 +81,10 @@ class Pupil_Remote(Plugin):
 
         self.use_primary_interface = use_primary_interface
         assert type(host) == str
-        assert type(port) == str
         self.host = host
-        self.port = port
+        self.port = g_pool.preferred_remote_port
 
-        self.start_server("tcp://{}:{}".format(host, port))
+        self.start_server("tcp://{}:{}".format(host, self.port))
         self.menu = None
 
     def start_server(self, new_address):
@@ -98,7 +95,7 @@ class Pupil_Remote(Plugin):
         if response == "Bind OK":
             host, port = msg.split(":")
             self.host = host
-            self.port = port
+            self.port = int(port)
             return
 
         # fail logic
@@ -107,7 +104,11 @@ class Pupil_Remote(Plugin):
         # for service we shut down
         if self.g_pool.app == "service":
             audio.say("Error: Port already in use.")
-            self.notify_all({"subject": "service_process.should_stop"})
+            # NOTE: We don't want a should_stop notification, but a hard termination at
+            # this point, because Service is still initializing at this point. This way
+            # we can prevent the eye processes from starting, where otherwise we would
+            # have to wait for them to be started until we can close them.
+            self.g_pool.service_should_run = False
             return
 
         # for capture we try to bind to a arbitrary port on the first external interface
@@ -119,7 +120,7 @@ class Pupil_Remote(Plugin):
             if response == "Bind OK":
                 host, port = msg.split(":")
                 self.host = host
-                self.port = port
+                self.port = int(port)
             else:
                 logger.error(msg)
                 raise Exception("Could not bind to port")
@@ -148,13 +149,13 @@ class Pupil_Remote(Plugin):
         if self.use_primary_interface:
 
             def set_port(new_port):
-                new_address = "tcp://*:" + new_port
+                new_address = "tcp://*:{}".format(new_port)
                 self.start_server(new_address)
                 self.update_menu()
 
             try:
                 ip = socket.gethostbyname(socket.gethostname())
-            except:
+            except Exception:
                 ip = "Your external ip"
 
         else:
@@ -237,19 +238,19 @@ class Pupil_Remote(Plugin):
 
         self.thread_pipe = None
 
-    def on_recv(self, socket, ipc_pub):
-        msg = socket.recv_string()
-        if msg.startswith("notify"):
-            try:
-                payload = zmq_tools.serializer.loads(
-                    socket.recv(flags=zmq.NOBLOCK), encoding="utf-8"
-                )
-                payload["subject"]
-            except Exception as e:
-                response = "Notification mal-formatted or missing: {}".format(e)
-            else:
-                ipc_pub.notify(payload)
-                response = "Notification recevied."
+    def on_recv(self, remote, ipc_pub):
+        msg = remote.recv_string()
+        if remote.get(zmq.RCVMORE):
+            ipc_pub.socket.send_string(msg, flags=zmq.SNDMORE)
+            while True:
+                frame = remote.recv(flags=zmq.NOBLOCK)
+                more_frames_coming = remote.get(zmq.RCVMORE)
+                if more_frames_coming:
+                    ipc_pub.socket.send(frame, flags=zmq.SNDMORE)
+                else:
+                    ipc_pub.socket.send(frame)
+                    break
+            response = "Message forwarded."
         elif msg == "SUB_PORT":
             response = self.g_pool.ipc_sub_url.split(":")[-1]
         elif msg == "PUB_PORT":
@@ -274,7 +275,7 @@ class Pupil_Remote(Plugin):
         elif msg[0] == "T":
             try:
                 target = float(msg[2:])
-            except:
+            except Exception:
                 response = "'{}' cannot be converted to float.".format(msg[2:])
             else:
                 raw_time = self.g_pool.get_now()
@@ -286,7 +287,8 @@ class Pupil_Remote(Plugin):
             response = "{}".format(self.g_pool.version)
         else:
             response = "Unknown command."
-        socket.send_string(response)
+        remote.send_string(response)
+        logger.debug("Request: '{}', Response: '{}'".format(msg, response))
 
     def on_notify(self, notification):
         """send simple string messages to control application functions.
@@ -302,7 +304,6 @@ class Pupil_Remote(Plugin):
 
     def get_init_dict(self):
         return {
-            "port": self.port,
             "host": self.host,
             "use_primary_interface": self.use_primary_interface,
         }
